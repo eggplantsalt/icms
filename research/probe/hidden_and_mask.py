@@ -15,6 +15,7 @@ import logging
 import torch
 from transformers import PreTrainedTokenizerBase
 
+from research.hooks.layer_utils import get_llm_layers
 logger = logging.getLogger(__name__)
 
 
@@ -44,13 +45,19 @@ def extract_hidden_states(model, inputs: Dict[str, torch.Tensor], layer_ids: Lis
     if hidden_states is None:
         raise RuntimeError("Model did not return hidden_states; ensure output_hidden_states=True.")
 
-    num_layers = len(hidden_states)
+    # LLM hidden_states 通常包含 embedding 输出，需要按 LLM 层数做偏移对齐。
+    llm_layers = get_llm_layers(model)
+    offset = 1 if len(hidden_states) > len(llm_layers) else 0
+    num_layers = len(llm_layers)
     selected: Dict[int, torch.Tensor] = {}
     for layer_id in layer_ids:
         idx = layer_id if layer_id >= 0 else num_layers + layer_id
         if idx < 0 or idx >= num_layers:
-            raise IndexError(f"layer_id {layer_id} is out of range for {num_layers} hidden_states")
-        selected[layer_id] = hidden_states[idx]
+            raise IndexError(f"layer_id {layer_id} is out of range for {num_layers} layers")
+        actual_idx = idx + offset
+        if actual_idx < 0 or actual_idx >= len(hidden_states):
+            raise IndexError(f"layer_id {layer_id} maps to hidden_states[{actual_idx}] out of range")
+        selected[layer_id] = hidden_states[actual_idx]
 
     return selected
 

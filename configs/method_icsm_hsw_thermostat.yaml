@@ -7,8 +7,7 @@ artifact_dir: /opt/data/private/openvla_icms/artifacts
 probe_root_dir: /opt/data/private/openvla_icms/probe
 tmp_dir: /opt/data/private/openvla_icms/tmp
 
-# Training data
-
+# Training data (update to your actual dataset name)
 dataset_name: bridge_orig
 batch_size: 16
 max_steps: 200000

@@ -101,6 +101,7 @@ python scripts/check_disk_safety.py \
 1. **配置文件**（最重要）：
    - baseline：修改 [configs/baseline_lora.yaml](configs/baseline_lora.yaml)
    - method：修改 [configs/method_icsm_hsw_thermostat.yaml](configs/method_icsm_hsw_thermostat.yaml)
+  - 注意：`dataset_name` 必须与本地实际数据集名称一致（LIBERO 不是 bridge_orig）。
 
 2. **数据路径**：
    - `data_root_dir`：训练数据（RLDS）

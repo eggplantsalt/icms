@@ -250,10 +250,19 @@ class TrainingStrategy(ABC):
         metrics: VLAMetrics,
         save_interval: int = 2500,
         save_full_model: bool = True,
+        method_enabled: bool = False,
+        hsw_state: Optional[object] = None,
+        thermostat: Optional[object] = None,
+        thermostat_state: Optional[object] = None,
+        probe_iter: Optional[object] = None,
+        method_log_interval: int = 10,
     ) -> None:
         """Run the VLA training loop for the given `dataset` and `collator`; log losses, action metrics to `metrics`."""
         assert isinstance(vla_dataset, IterableDataset), "VLA training expects an IterableDataset!"
         assert self.grad_accumulation_steps == 1, "VLA training does not support gradient accumulation!"
+        if method_enabled:
+            if thermostat is None or thermostat_state is None or probe_iter is None:
+                raise ValueError("method_enabled requires thermostat, thermostat_state, and probe_iter")
 
         # Create a DataLoader =>> Set `num_workers` to 0; RLDS loader handles parallelism!
         dataloader = DataLoader(
@@ -299,6 +308,31 @@ class TrainingStrategy(ABC):
                 # Commit Loss =>> Backward!
                 metrics.commit(loss=loss)
                 loss.backward()
+
+                # 研究方法：Thermostat 更新与 beta/gamma 调节
+                thermo_metrics = None
+                if method_enabled and thermostat is not None and probe_iter is not None:
+                    probe_batch = next(probe_iter)
+                    pixel_values = probe_batch["pixel_values"]
+                    if isinstance(pixel_values, dict):
+                        pixel_values = {k: v.to(self.device_id) for k, v in pixel_values.items()}
+                    else:
+                        pixel_values = pixel_values.to(self.device_id)
+                    probe_batch = {
+                        "input_ids": probe_batch["input_ids"].to(self.device_id),
+                        "attention_mask": probe_batch["attention_mask"].to(self.device_id),
+                        "pixel_values": pixel_values,
+                        "instructions": probe_batch["instructions"],
+                    }
+                    thermo_metrics = thermostat.maybe_update(
+                        metrics.global_step,
+                        self.vlm,
+                        probe_batch,
+                        thermostat_state,
+                    )
+                    if hsw_state is not None:
+                        hsw_state.beta = thermostat_state.beta
+                        hsw_state.gamma = thermostat_state.gamma
 
                 # === Compute Action Token Accuracy & L1 Loss ===
 
@@ -371,6 +405,19 @@ class TrainingStrategy(ABC):
                 # Push Metrics
                 metrics.commit(global_step=metrics.global_step + 1, epoch=epoch, lr=self.lr_scheduler.get_last_lr()[0])
                 status = metrics.push()
+
+                if method_enabled and thermo_metrics is not None and (metrics.global_step % method_log_interval) == 0:
+                    if overwatch.is_rank_zero():
+                        metrics.log(
+                            metrics.global_step,
+                            {
+                                "Method/Drift": thermo_metrics["d"],
+                                "Method/Beta": thermo_metrics["beta"],
+                                "Method/Gamma": thermo_metrics["gamma"],
+                                "Method/GNorm": hsw_state.last_g_norm if hsw_state is not None else 0.0,
+                                "Method/GPrimeNorm": hsw_state.last_gprime_norm if hsw_state is not None else 0.0,
+                            },
+                        )
 
                 # Check for Save Interval or Max Steps & Save Checkpoint
                 if (terminate := (self.max_steps is not None and metrics.global_step >= self.max_steps)) or (

@@ -76,7 +76,9 @@ class GenerateConfig:
     # Utils
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add in run ID for logging
-    local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    run_root_dir: str = "/opt/data/private/openvla_icms/runs"  # Root directory for eval logs
+    cache_dir: str = "/opt/data/private/openvla_icms/hf_cache"  # HF cache directory
+    local_log_dir: Optional[str] = None              # Optional override for eval logs
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
@@ -93,6 +95,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+
+    os.environ.setdefault("HF_HOME", cfg.cache_dir)
+    os.environ.setdefault("TRANSFORMERS_CACHE", cfg.cache_dir)
+    os.environ.setdefault("HF_DATASETS_CACHE", cfg.cache_dir)
+    os.environ.setdefault("TORCH_HOME", os.path.join(os.path.dirname(cfg.cache_dir), "torch_cache"))
+    os.environ.setdefault("OPENVLA_ROLLOUT_DIR", os.path.join(cfg.run_root_dir, "rollouts"))
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
@@ -120,8 +128,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
-    os.makedirs(cfg.local_log_dir, exist_ok=True)
-    local_log_filepath = os.path.join(cfg.local_log_dir, run_id + ".txt")
+    log_dir = cfg.local_log_dir or os.path.join(cfg.run_root_dir, "eval_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    local_log_filepath = os.path.join(log_dir, run_id + ".txt")
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
 

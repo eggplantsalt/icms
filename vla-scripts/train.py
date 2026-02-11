@@ -18,6 +18,7 @@ Run with:
 import json
 import os
 import re
+from itertools import cycle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -34,6 +35,14 @@ from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
 from prismatic.vla import get_vla_dataset_and_collator
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+
+from research.hooks.hsw_hook import HSWState, HSWHookManager, load_subspaces
+from research.hooks.layer_utils import get_llm_layers
+from research.probe.probe_dataset import (
+    build_probe_dataloader_from_components,
+    build_probe_jsonl_dataloader_from_components,
+)
+from research.thermostat.thermostat import Thermostat, ThermostatConfig, ThermostatState
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -53,10 +62,12 @@ class TrainConfig:
     )
 
     # Directory Paths
+    cache_dir: Path = Path("/opt/data/private/openvla_icms/hf_cache")
     data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
-        "datasets/open-x-embodiment"
+        "/opt/data/private/openvla_icms/datasets"
     )
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
+    run_root_dir: Path = Path("/opt/data/private/openvla_icms/runs")
+    tmp_dir: Path = Path("/opt/data/private/openvla_icms/tmp")
 
     # Resume Run Parameters
     pretrained_checkpoint: Optional[Path] = None                    # Absolute Path to Checkpoint
@@ -79,6 +90,31 @@ class TrainConfig:
     trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+
+    # Research Method Parameters (optional)
+    method_enabled: bool = False
+    probe_root_dir: Path = Path("/opt/data/private/openvla_icms/probe")
+    artifact_dir: Path = Path("/opt/data/private/openvla_icms/artifacts")
+    probe_dataset_name: str = "bridge_orig"
+    probe_jsonl: Optional[Path] = None
+    probe_image_root: Optional[Path] = None
+    probe_batch_size: int = 16
+
+    icms_artifact_dir: Optional[Path] = None
+    hsw_layer_ids: Optional[Tuple[int, ...]] = None
+    hsw_beta: float = 1.0
+    hsw_gamma: float = 1.0
+    hsw_eps: float = 1e-8
+    prompt_template: str = "In: {instruction}\nOut:"
+
+    thermostat_update_interval: int = 100
+    thermostat_warmup_steps: int = 200
+    thermostat_min_beta: float = 0.2
+    thermostat_max_beta: float = 1.0
+    thermostat_min_gamma: float = 0.1
+    thermostat_max_gamma: float = 1.0
+    thermostat_k_beta: float = 1.0
+    thermostat_k_gamma: float = 1.0
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -106,6 +142,11 @@ class TrainConfig:
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
     overwatch.info("OpenVLA Training :: Warming Up")
+
+    os.environ.setdefault("HF_HOME", str(cfg.cache_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(cfg.cache_dir))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(cfg.cache_dir))
+    os.environ.setdefault("TORCH_HOME", str(cfg.cache_dir.parent / "torch_cache"))
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
@@ -226,6 +267,90 @@ def train(cfg: TrainConfig) -> None:
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
 
+    # 研究方法初始化（可选，FSDP 入口）
+    hsw_state = None
+    thermostat = None
+    thermostat_state = None
+    probe_iter = None
+    if cfg.method_enabled:
+        icms_dir = cfg.icms_artifact_dir or (cfg.artifact_dir / "icms_openvla-7b")
+        meta_path = icms_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"ICSM meta.json not found at {meta_path}")
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        llm_layers = get_llm_layers(train_strategy.vlm)
+        num_layers = len(llm_layers)
+        hsw_layers = list(cfg.hsw_layer_ids) if cfg.hsw_layer_ids is not None else list(range(num_layers - 4, num_layers))
+
+        group_mapping = meta.get("group_mapping", {})
+        group_a = group_mapping.get("group_a", [num_layers - 4, num_layers - 3])
+        group_b = group_mapping.get("group_b", [num_layers - 2, num_layers - 1])
+        rep_layers = group_mapping.get("rep_layers", [num_layers - 3, num_layers - 1])
+
+        rep_to_subspace = load_subspaces(str(icms_dir), rep_layers, device=torch.device(device_id))
+        layer_to_subspace = {}
+        for layer_id in hsw_layers:
+            if layer_id in group_a:
+                rep = rep_layers[0]
+            else:
+                rep = rep_layers[-1]
+            layer_to_subspace[layer_id] = rep_to_subspace[rep]
+
+        hsw_state = HSWState(beta=cfg.hsw_beta, gamma=cfg.hsw_gamma, eps=cfg.hsw_eps)
+        hsw_manager = HSWHookManager(train_strategy.vlm, layer_to_subspace, hsw_state)
+        hsw_manager.register()
+
+        teacher_stats = {}
+        for rep in rep_layers:
+            mu = torch.load(icms_dir / f"mu{rep}.pt", map_location="cpu")
+            c_t = torch.load(icms_dir / f"C_T{rep}.pt", map_location="cpu")
+            teacher_stats[rep] = {"mu": mu, "C_T": c_t}
+
+        thermostat_cfg = ThermostatConfig(
+            update_interval=cfg.thermostat_update_interval,
+            warmup_steps=cfg.thermostat_warmup_steps,
+            min_beta=cfg.thermostat_min_beta,
+            max_beta=cfg.thermostat_max_beta,
+            min_gamma=cfg.thermostat_min_gamma,
+            max_gamma=cfg.thermostat_max_gamma,
+            k_beta=cfg.thermostat_k_beta,
+            k_gamma=cfg.thermostat_k_gamma,
+        )
+        tokenizer = vlm.llm_backbone.get_tokenizer()
+        image_transform = vlm.vision_backbone.get_image_transform()
+        thermostat = Thermostat(
+            teacher_stats=teacher_stats,
+            rep_layer_ids=rep_layers,
+            config=thermostat_cfg,
+            prompt_template=cfg.prompt_template,
+            processor_or_tokenizer=tokenizer,
+        )
+        thermostat_state = ThermostatState(beta=cfg.hsw_beta, gamma=cfg.hsw_gamma)
+
+        if cfg.probe_jsonl is not None:
+            probe_loader = build_probe_jsonl_dataloader_from_components(
+                tokenizer=tokenizer,
+                image_transform=image_transform,
+                jsonl_path=cfg.probe_jsonl,
+                image_root=cfg.probe_image_root,
+                prompt_template=cfg.prompt_template,
+                batch_size=cfg.probe_batch_size,
+            )
+        else:
+            probe_loader = build_probe_dataloader_from_components(
+                tokenizer=tokenizer,
+                image_transform=image_transform,
+                data_root_dir=cfg.probe_root_dir,
+                dataset_name=cfg.probe_dataset_name,
+                prompt_template=cfg.prompt_template,
+                batch_size=cfg.probe_batch_size,
+                resize_resolution=vlm.vision_backbone.default_image_resolution[1:],
+            )
+        probe_iter = cycle(probe_loader)
+
     # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
     overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
     metrics = VLAMetrics(
@@ -247,6 +372,11 @@ def train(cfg: TrainConfig) -> None:
         action_tokenizer,
         metrics,
         save_interval=cfg.save_interval,
+        method_enabled=cfg.method_enabled,
+        hsw_state=hsw_state,
+        thermostat=thermostat,
+        thermostat_state=thermostat_state,
+        probe_iter=probe_iter,
     )
 
     # Finalize

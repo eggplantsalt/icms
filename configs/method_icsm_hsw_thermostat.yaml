@@ -1,0 +1,48 @@
+vla_path: openvla/openvla-7b
+cache_dir: /opt/data/private/openvla_icms/hf_cache
+data_root_dir: /opt/data/private/openvla_icms/datasets
+run_root_dir: /opt/data/private/openvla_icms/runs
+adapter_tmp_dir: /opt/data/private/openvla_icms/tmp
+artifact_dir: /opt/data/private/openvla_icms/artifacts
+probe_root_dir: /opt/data/private/openvla_icms/probe
+tmp_dir: /opt/data/private/openvla_icms/tmp
+
+# Training data
+
+dataset_name: bridge_orig
+batch_size: 16
+max_steps: 200000
+save_steps: 5000
+learning_rate: 5e-4
+grad_accumulation_steps: 1
+image_aug: true
+
+# LoRA
+use_lora: true
+lora_rank: 32
+lora_dropout: 0.0
+use_quantization: false
+
+use_wandb: false
+run_id_note: method
+
+# Method
+method_enabled: true
+icms_artifact_dir: /opt/data/private/openvla_icms/artifacts/icms_openvla-7b
+hsw_beta: 1.0
+hsw_gamma: 1.0
+hsw_eps: 1e-8
+prompt_template: "In: {instruction}\nOut:"
+
+# Probe
+probe_dataset_name: bridge_orig
+probe_batch_size: 16
+
+thermostat_update_interval: 100
+thermostat_warmup_steps: 200
+thermostat_min_beta: 0.2
+thermostat_max_beta: 1.0
+thermostat_min_gamma: 0.1
+thermostat_max_gamma: 1.0
+thermostat_k_beta: 1.0
+thermostat_k_gamma: 1.0

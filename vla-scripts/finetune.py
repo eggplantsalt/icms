@@ -19,11 +19,13 @@ Run with:
                                     ...
 """
 
+import json
 import os
+from itertools import cycle
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import draccus
 import torch
@@ -44,6 +46,11 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+
+from research.hooks.hsw_hook import HSWState, HSWHookManager, load_subspaces
+from research.hooks.layer_utils import get_llm_layers
+from research.probe.probe_dataset import build_probe_dataloader, build_probe_jsonl_dataloader
+from research.thermostat.thermostat import Thermostat, ThermostatConfig, ThermostatState
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -78,10 +85,14 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
 
     # Directory Paths
-    data_root_dir: Path = Path("datasets/open-x-embodiment")        # Path to Open-X dataset directory
+    cache_dir: Path = Path("/opt/data/private/openvla_icms/hf_cache")
+    data_root_dir: Path = Path("/opt/data/private/openvla_icms/datasets")        # Path to Open-X dataset directory
+    probe_root_dir: Path = Path("/opt/data/private/openvla_icms/probe")
+    artifact_dir: Path = Path("/opt/data/private/openvla_icms/artifacts")
+    run_root_dir: Path = Path("/opt/data/private/openvla_icms/runs")             # Path to directory to store logs & checkpoints
+    adapter_tmp_dir: Path = Path("/opt/data/private/openvla_icms/tmp")           # Temporary directory for LoRA weights before fusing
+    tmp_dir: Path = Path("/opt/data/private/openvla_icms/tmp")
     dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
 
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
@@ -103,9 +114,34 @@ class FinetuneConfig:
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
     # Tracking Parameters
+    use_wandb: bool = True                                          # Whether to log to W&B
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+
+    # Research Method Parameters
+    method_enabled: bool = False                                    # Enable ICSM + HSW + Thermostat
+    icms_artifact_dir: Optional[Path] = None                         # Override artifact dir for ICSM outputs
+    hsw_layer_ids: Optional[List[int]] = None                        # Layer IDs to hook; default: last 4 layers
+    hsw_beta: float = 1.0                                            # Initial beta
+    hsw_gamma: float = 1.0                                           # Initial gamma
+    hsw_eps: float = 1e-8                                            # Stability epsilon for norm scaling
+    prompt_template: str = "In: {instruction}\nOut:"                 # Probe prompt template
+
+    # Probe Parameters (Thermostat)
+    probe_dataset_name: str = "bridge_orig"
+    probe_jsonl: Optional[Path] = None
+    probe_image_root: Optional[Path] = None
+    probe_batch_size: int = 16
+
+    thermostat_update_interval: int = 100
+    thermostat_warmup_steps: int = 200
+    thermostat_min_beta: float = 0.2
+    thermostat_max_beta: float = 1.0
+    thermostat_min_gamma: float = 0.1
+    thermostat_max_gamma: float = 1.0
+    thermostat_k_beta: float = 1.0
+    thermostat_k_gamma: float = 1.0
 
     # fmt: on
 
@@ -113,6 +149,12 @@ class FinetuneConfig:
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+
+    os.environ.setdefault("HF_HOME", str(cfg.cache_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(cfg.cache_dir))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(cfg.cache_dir))
+    os.environ.setdefault("TORCH_HOME", str(cfg.cache_dir.parent / "torch_cache"))
+    os.environ.setdefault("WANDB_DIR", str(cfg.cache_dir.parent / "wandb"))
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
@@ -154,13 +196,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True, cache_dir=cfg.cache_dir)
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
+        cache_dir=cfg.cache_dir,
     )
 
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
@@ -190,6 +233,86 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
+
+    # === 研究方法：ICSM + HSW + Thermostat（可开关） ===
+    hsw_manager = None
+    hsw_state = None
+    thermostat = None
+    thermostat_state = None
+    probe_iter = None
+    if cfg.method_enabled:
+        icms_dir = cfg.icms_artifact_dir or (cfg.artifact_dir / f"icms_{cfg.vla_path.split('/')[-1]}")
+        meta_path = icms_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"ICSM meta.json not found at {meta_path}")
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        llm_layers = get_llm_layers(vla)
+        num_layers = len(llm_layers)
+        hsw_layers = cfg.hsw_layer_ids or list(range(num_layers - 4, num_layers))
+
+        group_mapping = meta.get("group_mapping", {})
+        group_a = group_mapping.get("group_a", [num_layers - 4, num_layers - 3])
+        group_b = group_mapping.get("group_b", [num_layers - 2, num_layers - 1])
+        rep_layers = group_mapping.get("rep_layers", [num_layers - 3, num_layers - 1])
+
+        rep_to_subspace = load_subspaces(str(icms_dir), rep_layers, device=torch.device(device_id))
+        layer_to_subspace = {}
+        for layer_id in hsw_layers:
+            if layer_id in group_a:
+                rep = rep_layers[0]
+            else:
+                rep = rep_layers[-1]
+            layer_to_subspace[layer_id] = rep_to_subspace[rep]
+
+        hsw_state = HSWState(beta=cfg.hsw_beta, gamma=cfg.hsw_gamma, eps=cfg.hsw_eps)
+        hsw_manager = HSWHookManager(vla, layer_to_subspace, hsw_state)
+        hsw_manager.register()
+
+        teacher_stats = {}
+        for rep in rep_layers:
+            mu = torch.load(icms_dir / f"mu{rep}.pt", map_location="cpu")
+            c_t = torch.load(icms_dir / f"C_T{rep}.pt", map_location="cpu")
+            teacher_stats[rep] = {"mu": mu, "C_T": c_t}
+
+        thermostat_cfg = ThermostatConfig(
+            update_interval=cfg.thermostat_update_interval,
+            warmup_steps=cfg.thermostat_warmup_steps,
+            min_beta=cfg.thermostat_min_beta,
+            max_beta=cfg.thermostat_max_beta,
+            min_gamma=cfg.thermostat_min_gamma,
+            max_gamma=cfg.thermostat_max_gamma,
+            k_beta=cfg.thermostat_k_beta,
+            k_gamma=cfg.thermostat_k_gamma,
+        )
+        thermostat = Thermostat(
+            teacher_stats=teacher_stats,
+            rep_layer_ids=rep_layers,
+            config=thermostat_cfg,
+            prompt_template=cfg.prompt_template,
+            processor_or_tokenizer=processor,
+        )
+        thermostat_state = ThermostatState(beta=cfg.hsw_beta, gamma=cfg.hsw_gamma)
+
+        if cfg.probe_jsonl is not None:
+            probe_loader = build_probe_jsonl_dataloader(
+                processor,
+                jsonl_path=cfg.probe_jsonl,
+                image_root=cfg.probe_image_root,
+                prompt_template=cfg.prompt_template,
+                batch_size=cfg.probe_batch_size,
+            )
+        else:
+            probe_loader = build_probe_dataloader(
+                processor,
+                data_root_dir=cfg.probe_root_dir,
+                dataset_name=cfg.probe_dataset_name,
+                prompt_template=cfg.prompt_template,
+                batch_size=cfg.probe_batch_size,
+            )
+        probe_iter = cycle(probe_loader)
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
     #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
@@ -238,7 +361,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
 
     # Initialize Logging =>> W&B
-    if distributed_state.is_main_process:
+    if distributed_state.is_main_process and cfg.use_wandb:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
@@ -266,6 +389,23 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Backward pass
             normalized_loss.backward()
 
+            # Compute gradient step index
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+
+            # Thermostat 更新（各 rank 都执行，保证广播一致）
+            thermo_metrics = None
+            if cfg.method_enabled:
+                probe_batch = next(probe_iter)
+                probe_batch = {
+                    "input_ids": probe_batch["input_ids"].to(device_id),
+                    "attention_mask": probe_batch["attention_mask"].to(device_id),
+                    "pixel_values": probe_batch["pixel_values"].to(device_id, dtype=torch.bfloat16),
+                    "instructions": probe_batch["instructions"],
+                }
+                thermo_metrics = thermostat.maybe_update(gradient_step_idx, vla, probe_batch, thermostat_state)
+                hsw_state.beta = thermostat_state.beta
+                hsw_state.gamma = thermostat_state.gamma
+
             # Compute Accuracy and L1 Loss for Logging
             action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
             action_preds = action_logits.argmax(dim=2)
@@ -290,9 +430,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             recent_action_accuracies.append(action_accuracy.item())
             recent_l1_losses.append(action_l1_loss.item())
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
             # Compute smoothened train metrics
             #   =>> Equal to current step metrics when not using gradient accumulation
             #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
@@ -301,15 +438,35 @@ def finetune(cfg: FinetuneConfig) -> None:
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
 
             # Push Metrics to W&B (every 10 gradient steps)
-            if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                wandb.log(
-                    {
-                        "train_loss": smoothened_loss,
-                        "action_accuracy": smoothened_action_accuracy,
-                        "l1_loss": smoothened_l1_loss,
-                    },
-                    step=gradient_step_idx,
-                )
+            if distributed_state.is_main_process and gradient_step_idx % 10 == 0 and cfg.use_wandb:
+                payload = {
+                    "train_loss": smoothened_loss,
+                    "action_accuracy": smoothened_action_accuracy,
+                    "l1_loss": smoothened_l1_loss,
+                }
+                if cfg.method_enabled and thermo_metrics is not None:
+                    payload.update(
+                        {
+                            "drift_d": thermo_metrics["d"],
+                            "hsw_beta": thermo_metrics["beta"],
+                            "hsw_gamma": thermo_metrics["gamma"],
+                            "hsw_g_norm": hsw_state.last_g_norm,
+                            "hsw_gprime_norm": hsw_state.last_gprime_norm,
+                        }
+                    )
+                wandb.log(payload, step=gradient_step_idx)
+
+            if cfg.method_enabled and distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+                if thermo_metrics is not None:
+                    print(
+                        "[method] step", gradient_step_idx,
+                        "loss", round(smoothened_loss, 6),
+                        "d", round(thermo_metrics["d"], 6),
+                        "beta", round(thermo_metrics["beta"], 6),
+                        "gamma", round(thermo_metrics["gamma"], 6),
+                        "g", round(hsw_state.last_g_norm, 6),
+                        "g'", round(hsw_state.last_gprime_norm, 6),
+                    )
 
             # Optimizer Step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -336,7 +493,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
                 if cfg.use_lora:
                     base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+                        cfg.vla_path,
+                        torch_dtype=torch.bfloat16,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True,
+                        cache_dir=cfg.cache_dir,
                     )
                     merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
                     merged_vla = merged_vla.merge_and_unload()

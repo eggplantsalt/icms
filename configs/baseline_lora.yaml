@@ -1,0 +1,26 @@
+vla_path: openvla/openvla-7b
+cache_dir: /opt/data/private/openvla_icms/hf_cache
+data_root_dir: /opt/data/private/openvla_icms/datasets
+run_root_dir: /opt/data/private/openvla_icms/runs
+adapter_tmp_dir: /opt/data/private/openvla_icms/tmp
+artifact_dir: /opt/data/private/openvla_icms/artifacts
+probe_root_dir: /opt/data/private/openvla_icms/probe
+tmp_dir: /opt/data/private/openvla_icms/tmp
+
+dataset_name: bridge_orig
+batch_size: 16
+max_steps: 200000
+save_steps: 5000
+learning_rate: 5e-4
+grad_accumulation_steps: 1
+image_aug: true
+
+use_lora: true
+lora_rank: 32
+lora_dropout: 0.0
+use_quantization: false
+
+use_wandb: false
+run_id_note: baseline
+
+method_enabled: false

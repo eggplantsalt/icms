@@ -1,14 +1,14 @@
 vla_path: openvla/openvla-7b
 cache_dir: /opt/data/private/openvla_icms/hf_cache
-data_root_dir: /opt/data/private/openvla_icms/datasets
+data_root_dir: /opt/data/private/models/modified_libero_rlds
 run_root_dir: /opt/data/private/openvla_icms/runs
 adapter_tmp_dir: /opt/data/private/openvla_icms/tmp
 artifact_dir: /opt/data/private/openvla_icms/artifacts
-probe_root_dir: /opt/data/private/openvla_icms/probe
+probe_root_dir: /opt/data/private/models/modified_libero_rlds
 tmp_dir: /opt/data/private/openvla_icms/tmp
 
 # Training data (update to your actual dataset name)
-dataset_name: bridge_orig
+dataset_name: libero_spatial_no_noops
 batch_size: 16
 max_steps: 200000
 save_steps: 5000
@@ -34,7 +34,7 @@ hsw_eps: 1e-8
 prompt_template: "In: {instruction}\nOut:"
 
 # Probe
-probe_dataset_name: bridge_orig
+probe_dataset_name: libero_spatial_no_noops
 probe_batch_size: 16
 
 thermostat_update_interval: 100

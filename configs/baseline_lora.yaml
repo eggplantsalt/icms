@@ -8,11 +8,11 @@ probe_root_dir: /opt/data/private/modified_libero_rlds
 tmp_dir: /opt/data/private/openvla_icms/tmp
 
 dataset_name: libero_spatial_no_noops
-batch_size: 16
+batch_size: 4
 max_steps: 200000
 save_steps: 5000
 learning_rate: 5e-4
-grad_accumulation_steps: 1
+grad_accumulation_steps: 4
 image_aug: true
 
 use_lora: true

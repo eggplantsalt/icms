@@ -3,6 +3,7 @@ from __future__ import annotations
 """Thermostat 闭环控制：根据漂移调节 beta/gamma。"""
 
 from dataclasses import dataclass, field
+import contextlib
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -71,7 +72,12 @@ class Thermostat:
         }
         instructions = batch["instructions"]
 
-        with torch.no_grad():
+        amp_ctx = (
+            torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            if torch.cuda.is_available()
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), amp_ctx:
             hidden_by_layer = extract_hidden_states(model, inputs, self.rep_layer_ids)
 
         drifts = []
@@ -100,15 +106,18 @@ class Thermostat:
     ) -> Dict[str, float]:
         # 预热阶段只估计漂移基线；之后按间隔更新 beta/gamma。
         if step < self.config.warmup_steps:
+            # warmup 阶段每步都更新基线，避免 update_interval 太大导致基线样本过少
             d = self._compute_drift(model, batch)
             state.update_baseline(d)
-            return {"d": d, "beta": state.beta, "gamma": state.gamma}
+            return {"d": d, "beta": state.beta, "gamma": state.gamma, "baseline": state.drift_baseline or 0.0}
 
         if step % self.config.update_interval != 0:
-            return {"d": state.drift_baseline or 0.0, "beta": state.beta, "gamma": state.gamma}
+            return {"d": state.drift_baseline or 0.0, "beta": state.beta, "gamma": state.gamma, "baseline": state.drift_baseline or 0.0}
 
         d = self._compute_drift(model, batch)
         baseline = state.drift_baseline or d
+        if state.drift_baseline is None:
+            state.drift_baseline = baseline
         delta = max(0.0, d - baseline)
 
         beta = self.config.max_beta / (1.0 + self.config.k_beta * delta)
@@ -126,4 +135,4 @@ class Thermostat:
             state.beta = float(tensor[0].item())
             state.gamma = float(tensor[1].item())
 
-        return {"d": d, "beta": state.beta, "gamma": state.gamma}
+        return {"d": d, "beta": state.beta, "gamma": state.gamma, "baseline": state.drift_baseline or baseline}

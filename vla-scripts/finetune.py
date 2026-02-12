@@ -456,16 +456,27 @@ def finetune(cfg: FinetuneConfig) -> None:
                     )
                 wandb.log(payload, step=gradient_step_idx)
 
-            if cfg.method_enabled and distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+            if (
+                cfg.method_enabled
+                and distributed_state.is_main_process
+                and gradient_step_idx % 10 == 0
+                and (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+            ):
                 if thermo_metrics is not None:
                     print(
                         "[method] step", gradient_step_idx,
                         "loss", round(smoothened_loss, 6),
                         "d", round(thermo_metrics["d"], 6),
+                        "base", round(thermo_metrics.get("baseline", 0.0), 6),
                         "beta", round(thermo_metrics["beta"], 6),
                         "gamma", round(thermo_metrics["gamma"], 6),
                         "g", round(hsw_state.last_g_norm, 6),
-                        "g'", round(hsw_state.last_gprime_norm, 6),
+                        "gpre", round(hsw_state.last_gprime_norm_pre, 6),
+                        "gpost", round(hsw_state.last_gprime_norm_post, 6),
+                        "scale", round(hsw_state.last_scale, 6),
+                        "gf", round(hsw_state.last_gf_norm, 6),
+                        "gp", round(hsw_state.last_gp_norm, 6),
+                        "gn", round(hsw_state.last_gn_norm, 6),
                     )
 
             # Optimizer Step

@@ -17,12 +17,31 @@ class HSWState:
     eps: float = 1e-8
 
     last_g_norm: float = 0.0
-    last_gprime_norm: float = 0.0
+    last_gprime_norm_pre: float = 0.0
+    last_gprime_norm_post: float = 0.0
+    last_gf_norm: float = 0.0
+    last_gp_norm: float = 0.0
+    last_gn_norm: float = 0.0
+    last_scale: float = 1.0
 
-    def update_norms(self, g_norm: torch.Tensor, gprime_norm: torch.Tensor) -> None:
-        # 记录最近一次梯度范数，便于日志输出。
+    def update_norms(
+        self,
+        g_norm: torch.Tensor,
+        gprime_norm_pre: torch.Tensor,
+        gprime_norm_post: torch.Tensor,
+        gf_norm: torch.Tensor,
+        gp_norm: torch.Tensor,
+        gn_norm: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        # 记录最近一次梯度范数与分量范数，便于日志输出。
         self.last_g_norm = float(g_norm.detach().cpu().item())
-        self.last_gprime_norm = float(gprime_norm.detach().cpu().item())
+        self.last_gprime_norm_pre = float(gprime_norm_pre.detach().cpu().item())
+        self.last_gprime_norm_post = float(gprime_norm_post.detach().cpu().item())
+        self.last_gf_norm = float(gf_norm.detach().cpu().item())
+        self.last_gp_norm = float(gp_norm.detach().cpu().item())
+        self.last_gn_norm = float(gn_norm.detach().cpu().item())
+        self.last_scale = float(scale.detach().cpu().item())
 
 
 class HSWProjector:
@@ -37,8 +56,13 @@ class HSWProjector:
         orig_shape = g.shape
         g_flat = g.reshape(-1, orig_shape[-1])
 
-        gf = (g_flat @ self.uf) @ self.uf_t
-        gp = (g_flat @ self.up) @ self.up_t
+        uf = self.uf.to(dtype=g_flat.dtype, device=g_flat.device)
+        up = self.up.to(dtype=g_flat.dtype, device=g_flat.device)
+        uf_t = uf.t()
+        up_t = up.t()
+
+        gf = (g_flat @ uf) @ uf_t
+        gp = (g_flat @ up) @ up_t
         gn = g_flat - gf - gp
 
         return gf.reshape(orig_shape), gp.reshape(orig_shape), gn.reshape(orig_shape)
@@ -66,12 +90,12 @@ class HSWHookManager:
             self.projectors[layer_id] = projector
 
             def _hook(_module, grad_inputs, grad_outputs, _layer_id=layer_id):
-                # 对输出梯度做子空间重组并范数约束。
-                if not grad_outputs:
-                    return grad_outputs
-                grad = grad_outputs[0]
+                # 对输入梯度做子空间重组并范数约束。
+                if not grad_inputs:
+                    return grad_inputs
+                grad = grad_inputs[0]
                 if grad is None:
-                    return grad_outputs
+                    return grad_inputs
                 projector = self.projectors[_layer_id]
                 gf, gp, gn = projector.project(grad)
                 beta = self.state.beta
@@ -79,12 +103,25 @@ class HSWHookManager:
                 gprime = gn + beta * gp + gamma * gf
 
                 g_norm = torch.norm(grad)
-                gprime_norm = torch.norm(gprime)
-                scale = torch.minimum(torch.tensor(1.0, device=gprime.device), g_norm / (gprime_norm + self.state.eps))
+                gprime_norm_pre = torch.norm(gprime)
+                scale = torch.minimum(torch.tensor(1.0, device=gprime.device), g_norm / (gprime_norm_pre + self.state.eps))
                 gprime = gprime * scale
+                gprime_norm_post = torch.norm(gprime)
 
-                self.state.update_norms(g_norm, gprime_norm)
-                return (gprime,) + grad_outputs[1:]
+                gf_norm = torch.norm(gf)
+                gp_norm = torch.norm(gp)
+                gn_norm = torch.norm(gn)
+
+                self.state.update_norms(
+                    g_norm,
+                    gprime_norm_pre,
+                    gprime_norm_post,
+                    gf_norm,
+                    gp_norm,
+                    gn_norm,
+                    scale,
+                )
+                return (gprime,) + grad_inputs[1:]
 
             handle = layer.register_full_backward_hook(_hook)
             self.handles.append(handle)

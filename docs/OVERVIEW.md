@@ -1,6 +1,22 @@
-由于我们使用的是镜像，workspace是处在/目录下（/workspace），因此大的模型和数据集只能存在硬盘/opt/data/private下面新建一个文件夹，写代码文件的时候一定要注意数据集和模型的下载和调用路径
+--由于我们使用的是镜像，workspace是处在/目录下（/workspace），因此大的模型和数据集只能存在硬盘/opt/data/private下面新建一个文件夹，写代码文件的时候一定要注意数据集和模型的下载和调用路径
 
-和我对话的回答要用中文回复
+--和我对话的回答要用中文回复
+
+--由于我们的服务器无法连接huggingface，所以在新终端里需要export HF_ENDPOINT=https://hf-mirror.com用huggingface镜像
+
+--由于我们的服务器是没有显示屏的（headless）因此，在后续evaluate的时候，需要虚拟显示器，具体指令如下：
+apt-get install libegl-dev xvfb libgl1-mesa-dri libgl1-mesa-dev libgl1-mesa-glx libstdc++6
+export LIBGL_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri/ 
+ln -sf /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ${CONDA_PREFIX}/lib/libstdc++.so.6
+Xvfb :9 &
+export DISPLAY=:9
+export MUJOCO_GL=glx
+然后执行要执行的文件 
+
+
+
+--在进行github代码提交的过程中，如果发现不是你做的改动，而是用户自发做的代码改动，也是可以接受的。如果文件夹里有出现
+
 
 ---
 

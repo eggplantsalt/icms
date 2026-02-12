@@ -2,7 +2,7 @@
 
 这份指南面向完全没有代码基础的同学，目的是让你**知道要看哪些文件、改哪些配置、以及各模块在做什么**。即使暂时不运行，也能读懂项目结构与操作流程。
 
-> 重要约束：**任何大文件都不能写入 /workspace**。所有模型、数据、缓存、产物必须放在 `/opt/data/private/openvla_icms/` 下。
+> 重要约束：**任何大文件都不能写入 /workspace**。数据集保留在 `/opt/data/private/modified_libero_rlds`，缓存与训练产物统一放在 `/opt/data/private/openvla_icms/`。
 
 ---
 
@@ -53,13 +53,13 @@
 ## 3) 必须牢记的磁盘规则
 
 - **任何大文件不能写入 /workspace**。
-- 必须使用 `/opt/data/private/openvla_icms/` 作为总根目录。
-- 统一目录结构：
+- 训练产物与缓存使用 `/opt/data/private/openvla_icms/`。
+- 数据集可继续使用 `/opt/data/private/modified_libero_rlds`，无需搬迁。
+- 统一产物目录结构：
 
 ```
 /opt/data/private/openvla_icms/
   hf_cache/
-  datasets/
   probe/
   artifacts/
   runs/
@@ -104,8 +104,8 @@ python scripts/check_disk_safety.py \
   - 注意：`dataset_name` 必须与本地实际数据集名称一致（LIBERO 不是 bridge_orig）。
 
 2. **数据路径**：
-   - `data_root_dir`：训练数据（RLDS）
-   - `probe_root_dir`：探针数据（probe）
+  - `data_root_dir`：训练数据（RLDS），当前为 `/opt/data/private/modified_libero_rlds`
+  - `probe_root_dir`：探针数据（probe），放在 `/opt/data/private/openvla_icms/probe`
 
 3. **训练产物目录**：
    - `run_root_dir`：训练日志与 checkpoint
@@ -166,4 +166,4 @@ python scripts/check_disk_safety.py \
 
 ## 10) 你需要记住的一句话
 
-**所有大文件只能在 `/opt/data/private/openvla_icms/`，不要写入 /workspace。**
+**所有大文件只能在 `/opt/data/private/` 下；训练产物与缓存放 `/opt/data/private/openvla_icms/`，不要写入 /workspace。**

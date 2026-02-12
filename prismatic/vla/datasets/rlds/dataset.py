@@ -7,6 +7,7 @@ Core interface script for configuring and initializing RLDS datasets.
 import copy
 import inspect
 import json
+from pathlib import Path
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -199,7 +200,23 @@ def make_dataset_from_rlds(
 
         return traj
 
-    builder = tfds.builder(name, data_dir=data_dir)
+    try:
+        builder = tfds.builder(name, data_dir=data_dir)
+    except Exception as exc:
+        if exc.__class__.__name__ != "DatasetNotFoundError":
+            raise
+        # Fallback to prepared TFDS directory (e.g., local RLDS datasets).
+        candidate_root = Path(data_dir) / name
+        if candidate_root.is_dir():
+            version_dirs = sorted([p for p in candidate_root.iterdir() if p.is_dir()])
+            if version_dirs:
+                builder = tfds.builder_from_directory(str(version_dirs[-1]))
+            else:
+                raise
+        elif Path(data_dir).is_dir() and (Path(data_dir) / "dataset_info.json").is_file():
+            builder = tfds.builder_from_directory(str(Path(data_dir)))
+        else:
+            raise
 
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):

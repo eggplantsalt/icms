@@ -6,13 +6,13 @@
 
 - 激活环境：`conda activate openvla`
 - 若无法连接 HuggingFace：`export HF_ENDPOINT=https://hf-mirror.com`
-- 大文件禁止写入 /workspace；统一放在 `/opt/data/private/openvla_icms/` 下。
+- 大文件禁止写入 /workspace；数据集保留在 `/opt/data/private/modified_libero_rlds`，缓存与训练产物统一放在 `/opt/data/private/openvla_icms/`。
 
 默认目录（可通过参数覆盖，但必须位于 /opt/data/private）：
 
 ```
 HF_CACHE=/opt/data/private/openvla_icms/hf_cache
-DATA_ROOT=/opt/data/private/openvla_icms/datasets
+DATA_ROOT=/opt/data/private/modified_libero_rlds
 PROBE_ROOT=/opt/data/private/openvla_icms/probe
 ARTIFACT_ROOT=/opt/data/private/openvla_icms/artifacts
 RUN_ROOT=/opt/data/private/openvla_icms/runs
@@ -67,7 +67,7 @@ python -m research.icms.offline_icms \
   --cache_dir /opt/data/private/openvla_icms/hf_cache \
   --probe_root_dir /opt/data/private/openvla_icms/probe \
   --artifact_dir /opt/data/private/openvla_icms/artifacts/icms_openvla-7b \
-  --probe_dataset_name bridge_orig \
+  --probe_dataset_name libero_spatial_no_noops \
   --max_samples 500 \
   --sensitivity_samples 128
 ```
@@ -96,7 +96,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/train.py \
   --probe_root_dir /opt/data/private/openvla_icms/probe \
   --artifact_dir /opt/data/private/openvla_icms/artifacts \
   --icms_artifact_dir /opt/data/private/openvla_icms/artifacts/icms_openvla-7b \
-  --probe_dataset_name bridge_orig \
+  --probe_dataset_name libero_spatial_no_noops \
   --probe_batch_size 16 \
   --hsw_beta 1.0 \
   --hsw_gamma 1.0

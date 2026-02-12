@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, IterableDataset
-from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES
+from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 from prismatic.vla.datasets.rlds import make_interleaved_dataset
 
@@ -54,6 +54,7 @@ class ProbeRLDSDataset(IterableDataset):
         batch_transform: ProbeBatchTransform,
         resize_resolution: tuple[int, int],
         shuffle_buffer_size: int = 100_000,
+        frame_num_parallel_calls: int = 4,
         train: bool = True,
         image_aug: bool = False,
     ) -> None:
@@ -67,9 +68,14 @@ class ProbeRLDSDataset(IterableDataset):
         else:
             mixture_spec = [(self.data_mix, 1.0)]
 
-        per_dataset_kwargs, weights = make_probe_kwargs(
+        per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
             mixture_spec,
+            load_camera_views=("primary",),
+            load_depth=False,
+            load_proprio=False,
+            load_language=True,
+            action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
         )
 
         rlds_config = dict(
@@ -81,7 +87,7 @@ class ProbeRLDSDataset(IterableDataset):
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
-                num_parallel_calls=16,
+                num_parallel_calls=frame_num_parallel_calls,
             ),
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
@@ -194,32 +200,14 @@ class ProbeCollator:
         }
 
 
-def make_probe_kwargs(data_root_dir: Path, mixture_spec: List[tuple[str, float]]):
-    per_dataset_kwargs = []
-    weights = []
-    for dataset_name, weight in mixture_spec:
-        per_dataset_kwargs.append(
-            dict(
-                name=dataset_name,
-                data_root_dir=data_root_dir,
-                load_camera_views=("primary",),
-                load_depth=False,
-                load_proprio=False,
-                load_language=True,
-                action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
-            )
-        )
-        weights.append(weight)
-    return per_dataset_kwargs, np.array(weights, dtype=np.float32)
-
-
 def build_probe_dataloader(
     processor,
     data_root_dir: Path,
     dataset_name: str,
     prompt_template: str,
     batch_size: int,
-    shuffle_buffer_size: int = 100_000,
+    shuffle_buffer_size: int = 10_000,
+    frame_num_parallel_calls: int = 4,
     image_aug: bool = False,
 ) -> DataLoader:
     # 使用 Processor 构建 RLDS probe dataloader。
@@ -234,6 +222,7 @@ def build_probe_dataloader(
         batch_transform,
         resize_resolution=(processor.image_processor.input_sizes[0][1], processor.image_processor.input_sizes[0][2]),
         shuffle_buffer_size=shuffle_buffer_size,
+        frame_num_parallel_calls=frame_num_parallel_calls,
         image_aug=image_aug,
     )
     collator = ProbeCollator(
@@ -251,7 +240,8 @@ def build_probe_dataloader_from_components(
     prompt_template: str,
     batch_size: int,
     resize_resolution: tuple[int, int],
-    shuffle_buffer_size: int = 100_000,
+    shuffle_buffer_size: int = 10_000,
+    frame_num_parallel_calls: int = 4,
     image_aug: bool = False,
 ) -> DataLoader:
     # 使用 tokenizer + image_transform 构建 RLDS probe dataloader。
@@ -266,6 +256,7 @@ def build_probe_dataloader_from_components(
         batch_transform,
         resize_resolution=resize_resolution,
         shuffle_buffer_size=shuffle_buffer_size,
+        frame_num_parallel_calls=frame_num_parallel_calls,
         image_aug=image_aug,
     )
     collator = ProbeCollator(

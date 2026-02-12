@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """离线 ICSM 构建：探针统计 + 子空间 + 脆弱度排序。
 
 只运行一次 Teacher，产出 Uf/Up/mu/C_T 与 meta.json。
@@ -37,8 +35,8 @@ DEFAULT_PROMPT_TEMPLATE = "In: {instruction}\nOut:"
 class OfflineICMSConfig:
     vla_path: str = "openvla/openvla-7b"
     cache_dir: Path = Path("/opt/data/private/openvla_icms/hf_cache")
-    data_root_dir: Path = Path("/opt/data/private/openvla_icms/datasets")
-    probe_root_dir: Path = Path("/opt/data/private/openvla_icms/probe")
+    data_root_dir: Path = Path("/opt/data/private/modified_libero_rlds")
+    probe_root_dir: Path = Path("/opt/data/private/modified_libero_rlds")
     artifact_dir: Path = Path("/opt/data/private/openvla_icms/artifacts")
     tmp_dir: Path = Path("/opt/data/private/openvla_icms/tmp")
 
@@ -60,6 +58,9 @@ class OfflineICMSConfig:
 
     seed: int = 7
     use_bf16: bool = True
+
+    probe_shuffle_buffer_size: int = 1_000
+    probe_num_parallel_calls: int = 1
 
 
 def _set_seed(seed: int) -> None:
@@ -128,6 +129,8 @@ def _build_probe_loader(cfg: OfflineICMSConfig, processor) -> DataLoader:
         dataset_name=cfg.probe_dataset_name,
         prompt_template=cfg.prompt_template,
         batch_size=cfg.batch_size,
+        shuffle_buffer_size=cfg.probe_shuffle_buffer_size,
+        frame_num_parallel_calls=cfg.probe_num_parallel_calls,
     )
 
 
@@ -164,6 +167,7 @@ def _collect_probe_batches(
     instruction_log: List[str] = []
 
     seen = 0
+    batch_idx = 0
     for batch in probe_loader:
         if seen >= cfg.max_samples:
             break
@@ -190,6 +194,9 @@ def _collect_probe_batches(
 
         instruction_log.extend(instructions)
         seen += inputs["input_ids"].shape[0]
+        batch_idx += 1
+        if batch_idx % 10 == 0:
+            print(f"[icms] pooled {seen}/{cfg.max_samples} probe samples", flush=True)
 
     return pooled_per_layer, instruction_log
 
@@ -197,6 +204,8 @@ def _collect_probe_batches(
 def _compute_svd_subspace(x: torch.Tensor, r: int) -> torch.Tensor:
     # 对中心化矩阵做 SVD，取前 r 个方向。
     x_centered = x - x.mean(dim=0, keepdim=True)
+    if x_centered.dtype in (torch.bfloat16, torch.float16):
+        x_centered = x_centered.float()
     _, _, vh = torch.linalg.svd(x_centered, full_matrices=False)
     max_r = min(vh.shape[0], vh.shape[1])
     r = min(r, max_r)
@@ -218,6 +227,9 @@ def _compute_sensitivities(
 ) -> torch.Tensor:
     # 对每个方向做小扰动，计算输出分布变化（KL）。
     device = direction_matrix.device
+    model_dtype = next(model.parameters()).dtype
+    if direction_matrix.dtype != model_dtype:
+        direction_matrix = direction_matrix.to(dtype=model_dtype)
     layers = get_llm_layers(model)
     layer = layers[layer_id]
     r = direction_matrix.shape[1]
@@ -230,6 +242,8 @@ def _compute_sensitivities(
             patch_len = int(_infer_patch_len(model, inputs))
             pos = inputs["attention_mask"].sum(dim=1) - 1 + patch_len
             baseline_logits.append(logits[torch.arange(logits.shape[0]), pos])
+
+    print(f"[icms] sensitivity: layer={layer_id} r={r} batches={len(inputs_list)}", flush=True)
 
     sens = torch.zeros(r, device=device)
     for k in range(r):
@@ -263,6 +277,9 @@ def _compute_sensitivities(
         finally:
             handle.remove()
 
+        if (k + 1) % 8 == 0 or (k + 1) == r:
+            print(f"[icms] sensitivity progress: {k + 1}/{r}", flush=True)
+
     return sens
 
 
@@ -278,6 +295,7 @@ def _prepare_sensitivity_batches(
     masks_list: List[torch.BoolTensor] = []
 
     seen = 0
+    batch_idx = 0
     for batch in loader:
         if seen >= cfg.sensitivity_samples:
             break
@@ -297,6 +315,9 @@ def _prepare_sensitivity_batches(
         inputs_list.append(inputs)
         masks_list.append(mask)
         seen += inputs["input_ids"].shape[0]
+        batch_idx += 1
+        if batch_idx % 10 == 0:
+            print(f"[icms] prepared {seen}/{cfg.sensitivity_samples} sensitivity samples", flush=True)
 
     return inputs_list, masks_list
 

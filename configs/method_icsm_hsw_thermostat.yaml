@@ -10,9 +10,12 @@ tmp_dir: /opt/data/private/openvla_icms/tmp
 # Training data (update to your actual dataset name)
 dataset_name: libero_spatial_no_noops
 batch_size: 2
-max_steps: 1000
-save_steps: 500
+max_steps: 500
+save_steps: 250
 learning_rate: 2e-4
+min_learning_rate: 5e-5
+lr_scheduler: cosine
+lr_warmup_steps: 50
 grad_accumulation_steps: 8
 image_aug: true
 
@@ -37,11 +40,14 @@ prompt_template: "In: {instruction}\nOut:"
 probe_dataset_name: libero_spatial_no_noops
 probe_batch_size: 8
 
-thermostat_update_interval: 1
-thermostat_warmup_steps: 1
-thermostat_min_beta: 0.2
+thermostat_update_interval: 5
+thermostat_warmup_steps: 50
+thermostat_min_beta: 0.3
 thermostat_max_beta: 1.0
-thermostat_min_gamma: 0.1
+thermostat_min_gamma: 0.2
 thermostat_max_gamma: 1.0
-thermostat_k_beta: 1.0
-thermostat_k_gamma: 1.0
+thermostat_k_beta: 3.0
+thermostat_k_gamma: 3.0
+
+# HSW layer selection (use last 2 layers)
+hsw_layer_ids: [-2, -1]

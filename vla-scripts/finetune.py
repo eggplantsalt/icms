@@ -20,6 +20,7 @@ Run with:
 """
 
 import json
+import math
 import os
 from itertools import cycle
 from collections import deque
@@ -99,6 +100,9 @@ class FinetuneConfig:
     max_steps: int = 200_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
     learning_rate: float = 5e-4                                     # Fine-tuning learning rate
+    min_learning_rate: float = 1e-5                                 # Minimum LR for cosine schedule
+    lr_scheduler: str = "none"                                       # none | cosine
+    lr_warmup_steps: int = 0                                         # Linear warmup steps before schedule
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
@@ -227,9 +231,25 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
-    # Create Optimizer =>> note that we default to a simple constant learning rate!
+    # Create Optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+
+    # Optional LR scheduler (warmup + cosine)
+    scheduler = None
+    if cfg.lr_scheduler == "cosine":
+        total_steps = max(1, cfg.max_steps)
+        warmup_steps = max(0, cfg.lr_warmup_steps)
+
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return (step + 1) / warmup_steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+            min_ratio = cfg.min_learning_rate / cfg.learning_rate
+            return min_ratio + (1.0 - min_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -482,6 +502,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Optimizer Step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
 

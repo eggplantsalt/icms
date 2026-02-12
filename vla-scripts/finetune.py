@@ -105,10 +105,11 @@ class FinetuneConfig:
     lr_warmup_steps: int = 0                                         # Linear warmup steps before schedule
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
-    shuffle_buffer_size: int = 100_000                              # Dataloader shuffle buffer size (can reduce if OOM)
+    shuffle_buffer_size: int = 5000                             # Dataloader shuffle buffer size (can reduce if OOM)
     save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
+    merge_lora_during_training: bool = False                        # Merge LoRA into full model at save time (high memory)
 
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
@@ -131,6 +132,11 @@ class FinetuneConfig:
     hsw_gamma: float = 1.0                                           # Initial gamma
     hsw_eps: float = 1e-8                                            # Stability epsilon for norm scaling
     prompt_template: str = "In: {instruction}\nOut:"                 # Probe prompt template
+
+    # Resume Parameters
+    resume_adapter_dir: Optional[Path] = None                        # LoRA adapter dir to resume from
+    resume_full_model_dir: Optional[Path] = None                     # Full model dir to resume from (non-LoRA)
+    resume_global_step: int = 0                                      # Global step offset for logging/schedules
 
     # Probe Parameters (Thermostat)
     probe_dataset_name: str = "bridge_orig"
@@ -201,8 +207,13 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load OpenVLA Processor and Model using HF AutoClasses
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True, cache_dir=cfg.cache_dir)
+
+    if cfg.use_lora and cfg.resume_full_model_dir is not None:
+        raise ValueError("resume_full_model_dir is only valid when use_lora is False")
+
+    model_load_path = cfg.resume_full_model_dir or cfg.vla_path
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
+        model_load_path,
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
         low_cpu_mem_usage=True,
@@ -225,7 +236,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             target_modules="all-linear",
             init_lora_weights="gaussian",
         )
-        vla = get_peft_model(vla, lora_config)
+        if cfg.resume_adapter_dir is not None:
+            if not cfg.resume_adapter_dir.exists():
+                raise FileNotFoundError(f"LoRA adapter dir not found: {cfg.resume_adapter_dir}")
+            vla = PeftModel.from_pretrained(vla, cfg.resume_adapter_dir, is_trainable=True)
+            print(f"Resumed LoRA adapter from: {cfg.resume_adapter_dir}")
+        else:
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
@@ -390,7 +407,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    start_step = max(0, int(cfg.resume_global_step))
+    if start_step >= cfg.max_steps:
+        raise ValueError("resume_global_step must be < max_steps")
+
+    with tqdm.tqdm(total=cfg.max_steps - start_step, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -410,7 +431,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            gradient_step_idx = start_step + (batch_idx // cfg.grad_accumulation_steps)
 
             # Thermostat 更新（各 rank 都执行，保证广播一致）
             thermo_metrics = None
@@ -483,8 +504,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 and (batch_idx + 1) % cfg.grad_accumulation_steps == 0
             ):
                 if thermo_metrics is not None:
+                    current_lr = optimizer.param_groups[0]["lr"]
                     print(
                         "[method] step", gradient_step_idx,
+                        "lr", round(current_lr, 8),
                         "loss", round(smoothened_loss, 6),
                         "d", round(thermo_metrics["d"], 6),
                         "base", round(thermo_metrics.get("baseline", 0.0), 6),
@@ -523,8 +546,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 dist.barrier()
 
                 # Merge LoRA weights into model backbone for faster inference
-                #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
+                #   =>> Note that merging is slow and memory-heavy; keep disabled during training to avoid OOM.
+                if cfg.use_lora and cfg.merge_lora_during_training:
                     base_vla = AutoModelForVision2Seq.from_pretrained(
                         cfg.vla_path,
                         torch_dtype=torch.bfloat16,
@@ -558,7 +581,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 dist.barrier()
 
             # Stop training when max_steps is reached
-            if gradient_step_idx == cfg.max_steps:
+            if gradient_step_idx >= cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
 

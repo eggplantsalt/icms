@@ -75,6 +75,9 @@ class RLDSDataset(IterableDataset):
         batch_transform: RLDSBatchTransform,
         resize_resolution: Tuple[int, int],
         shuffle_buffer_size: int = 256_000,
+        frame_transform_parallel_calls: int = 16,
+        traj_transform_threads: int = 1,
+        traj_read_threads: int = 1,
         train: bool = True,
         image_aug: bool = False,
     ) -> None:
@@ -107,14 +110,14 @@ class RLDSDataset(IterableDataset):
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
-                num_parallel_calls=16,                          # For CPU-intensive ops (decoding, resizing, etc.)
+                num_parallel_calls=frame_transform_parallel_calls, # For CPU-intensive ops (decoding, resizing, etc.)
             ),
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
             sample_weights=weights,
             balance_weights=True,
-            traj_transform_threads=len(mixture_spec),
-            traj_read_threads=len(mixture_spec),
+            traj_transform_threads=max(1, traj_transform_threads),
+            traj_read_threads=max(1, traj_read_threads),
             train=train,
         )
 

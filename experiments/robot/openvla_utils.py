@@ -107,6 +107,13 @@ def get_vla(cfg):
                 setattr(target, "norm_stats", norm_stats)
             except Exception:
                 pass
+
+        bound_predict_action_self = getattr(getattr(vla, "predict_action", None), "__self__", None)
+        if bound_predict_action_self is not None:
+            try:
+                setattr(bound_predict_action_self, "norm_stats", norm_stats)
+            except Exception:
+                pass
         print(
             f"[*] Loaded dataset statistics from: {dataset_statistics_path} "
             f"(keys={list(norm_stats.keys())[:3]}, total={len(norm_stats)})"

@@ -22,6 +22,10 @@ Run with:
 import json
 import math
 import os
+import re
+import subprocess
+import sys
+import time
 from itertools import cycle
 from collections import deque
 from dataclasses import dataclass
@@ -84,6 +88,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class FinetuneConfig:
     # fmt: off
     vla_path: str = "openvla/openvla-7b"                            # Path to OpenVLA model (on HuggingFace Hub)
+    server_profile: Optional[str] = None                             # Optional launcher profile flag (e.g., 4090_1gpu / v100_8gpu)
 
     # Directory Paths
     cache_dir: Path = Path("/opt/data/private/openvla_icms/hf_cache")
@@ -106,10 +111,25 @@ class FinetuneConfig:
     grad_accumulation_steps: int = 1                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 5000                             # Dataloader shuffle buffer size (can reduce if OOM)
+    rlds_frame_parallel_calls: int = 32                             # RLDS frame transform parallel calls
+    rlds_traj_transform_threads: int = 8                            # RLDS trajectory transform worker threads
+    rlds_traj_read_threads: int = 8                                 # RLDS trajectory read worker threads
     save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
                                                                     #   continually overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
     merge_lora_during_training: bool = False                        # Merge LoRA into full model at save time (high memory)
+
+    # Periodic Evaluation & Early Stopping
+    enable_periodic_eval: bool = False                               # Run LIBERO eval every N training steps
+    eval_every_steps: int = 1000                                     # Eval interval in steps (must be multiple of save_steps)
+    eval_task_suite_name: str = "libero_spatial"                    # LIBERO task suite for periodic eval
+    eval_num_trials_per_task: int = 1                                # Number of trials per task during periodic eval
+    eval_center_crop: bool = True                                    # Whether to use center crop during eval
+    eval_run_id_note: Optional[str] = None                           # Optional extra run_id note for eval logs
+
+    early_stopping_enabled: bool = False                             # Stop training when eval metric stops improving
+    early_stopping_patience: int = 5                                 # Number of eval rounds without improvement before stop
+    early_stopping_min_delta: float = 0.1                            # Minimum improvement in success rate (percentage points)
 
     # LoRA Arguments
     use_lora: bool = True                                           # Whether to use LoRA fine-tuning
@@ -171,6 +191,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     distributed_state = PartialState()
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
@@ -390,6 +417,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_transform,
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
+        frame_transform_parallel_calls=cfg.rlds_frame_parallel_calls,
+        traj_transform_threads=cfg.rlds_traj_transform_threads,
+        traj_read_threads=cfg.rlds_traj_read_threads,
         image_aug=cfg.image_aug,
     )
 
@@ -417,6 +447,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_step_times = deque(maxlen=20)
+    optimizer_step_t0 = time.time()
 
     # Train!
     if cfg.resume_global_step > 0:
@@ -432,10 +464,100 @@ def finetune(cfg: FinetuneConfig) -> None:
     if start_step >= cfg.max_steps:
         raise ValueError("resume_global_step must be < max_steps")
 
+    if cfg.enable_periodic_eval:
+        if cfg.eval_every_steps <= 0:
+            raise ValueError("eval_every_steps must be > 0 when enable_periodic_eval=True")
+        if cfg.eval_every_steps % cfg.save_steps != 0:
+            raise ValueError("eval_every_steps must be a multiple of save_steps so eval always uses latest checkpoint")
+
+    best_eval_success = -float("inf")
+    no_improve_evals = 0
+
+    def _run_periodic_eval(step: int) -> Optional[float]:
+        checkpoint_path = adapter_dir if cfg.use_lora else run_dir
+        run_note = cfg.eval_run_id_note or (cfg.run_id_note or "train")
+        run_note = f"{run_note}-step{step}"
+
+        eval_cmd = [
+            sys.executable,
+            "experiments/robot/libero/run_libero_eval.py",
+            "--model_family",
+            "openvla",
+            "--pretrained_checkpoint",
+            str(checkpoint_path),
+            "--task_suite_name",
+            cfg.eval_task_suite_name,
+            "--center_crop",
+            str(cfg.eval_center_crop),
+            "--num_trials_per_task",
+            str(cfg.eval_num_trials_per_task),
+            "--dataset_stats_dir",
+            str(run_dir),
+            "--run_id_note",
+            run_note,
+            "--use_wandb",
+            "False",
+        ]
+
+        if distributed_state.is_main_process:
+            print(f"[eval] Running periodic eval at step {step}: {' '.join(eval_cmd)}")
+        eval_env = os.environ.copy()
+        for key in [
+            "RANK",
+            "WORLD_SIZE",
+            "LOCAL_RANK",
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "TORCHELASTIC_RUN_ID",
+            "TORCHELASTIC_RESTART_COUNT",
+            "TORCHELASTIC_MAX_RESTARTS",
+            "TORCHELASTIC_ERROR_FILE",
+            "ACCELERATE_USE_DISTRIBUTED",
+        ]:
+            eval_env.pop(key, None)
+        result = subprocess.run(eval_cmd, capture_output=True, text=True, env=eval_env)
+        if distributed_state.is_main_process:
+            if result.returncode != 0:
+                print(f"[eval] failed at step {step} with code {result.returncode}")
+                if result.stderr:
+                    print(result.stderr[-2000:])
+                return None
+
+            eval_log_dir = cfg.run_root_dir / "eval_logs"
+            pattern = f"EVAL-{cfg.eval_task_suite_name}-openvla-*--{run_note}.txt"
+            candidates = sorted(eval_log_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not candidates:
+                print(f"[eval] no eval log found for step {step} (pattern={pattern})")
+                return None
+
+            log_path = candidates[0]
+            success_rate = None
+            regex = re.compile(r"# successes:\s+\d+\s+\(([0-9.]+)%\)")
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = regex.search(line)
+                    if m:
+                        success_rate = float(m.group(1))
+
+            if success_rate is None:
+                print(f"[eval] unable to parse success rate from log: {log_path}")
+                return None
+
+            print(f"[eval] step {step} success_rate={success_rate:.2f}% ({log_path})")
+            return success_rate
+
+        return None
+
     with tqdm.tqdm(total=cfg.max_steps - start_step, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
+            should_stop = False
+            is_optimizer_step = (batch_idx + 1) % cfg.grad_accumulation_steps == 0
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
@@ -456,15 +578,20 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Thermostat 更新（各 rank 都执行，保证广播一致）
             thermo_metrics = None
-            if cfg.method_enabled:
-                probe_batch = next(probe_iter)
-                probe_batch = {
-                    "input_ids": probe_batch["input_ids"].to(device_id),
-                    "attention_mask": probe_batch["attention_mask"].to(device_id),
-                    "pixel_values": probe_batch["pixel_values"].to(device_id, dtype=torch.bfloat16),
-                    "instructions": probe_batch["instructions"],
-                }
-                thermo_metrics = thermostat.maybe_update(gradient_step_idx, vla, probe_batch, thermostat_state)
+            if cfg.method_enabled and is_optimizer_step:
+                should_update_thermostat = (
+                    gradient_step_idx < cfg.thermostat_warmup_steps
+                    or gradient_step_idx % cfg.thermostat_update_interval == 0
+                )
+                if should_update_thermostat:
+                    probe_batch = next(probe_iter)
+                    probe_batch = {
+                        "input_ids": probe_batch["input_ids"].to(device_id),
+                        "attention_mask": probe_batch["attention_mask"].to(device_id),
+                        "pixel_values": probe_batch["pixel_values"].to(device_id, dtype=torch.bfloat16),
+                        "instructions": probe_batch["instructions"],
+                    }
+                    thermo_metrics = thermostat.maybe_update(gradient_step_idx, vla, probe_batch, thermostat_state)
                 hsw_state.beta = thermostat_state.beta
                 hsw_state.gamma = thermostat_state.gamma
 
@@ -518,41 +645,50 @@ def finetune(cfg: FinetuneConfig) -> None:
                     )
                 wandb.log(payload, step=gradient_step_idx)
 
-            if (
-                cfg.method_enabled
-                and distributed_state.is_main_process
-                and gradient_step_idx % 10 == 0
-                and (batch_idx + 1) % cfg.grad_accumulation_steps == 0
-            ):
-                if thermo_metrics is not None:
-                    current_lr = optimizer.param_groups[0]["lr"]
-                    print(
-                        "[method] step", gradient_step_idx,
-                        "lr", round(current_lr, 8),
-                        "loss", round(smoothened_loss, 6),
-                        "d", round(thermo_metrics["d"], 6),
-                        "base", round(thermo_metrics.get("baseline", 0.0), 6),
-                        "beta", round(thermo_metrics["beta"], 6),
-                        "gamma", round(thermo_metrics["gamma"], 6),
-                        "g", round(hsw_state.last_g_norm, 6),
-                        "gpre", round(hsw_state.last_gprime_norm_pre, 6),
-                        "gpost", round(hsw_state.last_gprime_norm_post, 6),
-                        "scale", round(hsw_state.last_scale, 6),
-                        "gf", round(hsw_state.last_gf_norm, 6),
-                        "gp", round(hsw_state.last_gp_norm, 6),
-                        "gn", round(hsw_state.last_gn_norm, 6),
-                    )
-
             # Optimizer Step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if is_optimizer_step:
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
+                step_time = time.time() - optimizer_step_t0
+                optimizer_step_t0 = time.time()
+                recent_step_times.append(step_time)
+
+                if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    avg_step_time = sum(recent_step_times) / len(recent_step_times) if recent_step_times else step_time
+                    if cfg.method_enabled and thermo_metrics is not None:
+                        print(
+                            "[method] step", gradient_step_idx,
+                            "lr", round(current_lr, 8),
+                            "loss", round(smoothened_loss, 6),
+                            "sec/step", round(avg_step_time, 3),
+                            "d", round(thermo_metrics["d"], 6),
+                            "base", round(thermo_metrics.get("baseline", 0.0), 6),
+                            "beta", round(thermo_metrics["beta"], 6),
+                            "gamma", round(thermo_metrics["gamma"], 6),
+                            "g", round(hsw_state.last_g_norm, 6),
+                            "gpre", round(hsw_state.last_gprime_norm_pre, 6),
+                            "gpost", round(hsw_state.last_gprime_norm_post, 6),
+                            "scale", round(hsw_state.last_scale, 6),
+                            "gf", round(hsw_state.last_gf_norm, 6),
+                            "gp", round(hsw_state.last_gp_norm, 6),
+                            "gn", round(hsw_state.last_gn_norm, 6),
+                        )
+                    else:
+                        print(
+                            "[train] step", gradient_step_idx,
+                            "lr", round(current_lr, 8),
+                            "loss", round(smoothened_loss, 6),
+                            "acc", round(smoothened_action_accuracy, 6),
+                            "l1", round(smoothened_l1_loss, 6),
+                            "sec/step", round(avg_step_time, 3),
+                        )
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
-            if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
+            if is_optimizer_step and gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
@@ -620,6 +756,38 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Block on Main Process Checkpointing
                 dist.barrier()
+
+                if cfg.enable_periodic_eval and gradient_step_idx % cfg.eval_every_steps == 0:
+                    eval_success = None
+                    if distributed_state.is_main_process:
+                        eval_success = _run_periodic_eval(gradient_step_idx)
+
+                        if (
+                            cfg.early_stopping_enabled
+                            and eval_success is not None
+                        ):
+                            if eval_success > (best_eval_success + cfg.early_stopping_min_delta):
+                                best_eval_success = eval_success
+                                no_improve_evals = 0
+                                print(
+                                    f"[early-stop] improvement at step {gradient_step_idx}: "
+                                    f"best={best_eval_success:.2f}%"
+                                )
+                            else:
+                                no_improve_evals += 1
+                                print(
+                                    f"[early-stop] no improvement ({no_improve_evals}/{cfg.early_stopping_patience}) "
+                                    f"at step {gradient_step_idx}; best={best_eval_success:.2f}%"
+                                )
+                                if no_improve_evals >= cfg.early_stopping_patience:
+                                    should_stop = True
+                                    print("[early-stop] patience reached, requesting stop.")
+
+                    stop_signal = torch.tensor([1 if should_stop else 0], device=device_id, dtype=torch.int32)
+                    dist.broadcast(stop_signal, src=0)
+                    if int(stop_signal.item()) == 1:
+                        print(f"Early stopping at step {gradient_step_idx}.")
+                        break
 
             # Stop training when max_steps is reached
             if gradient_step_idx >= cfg.max_steps:

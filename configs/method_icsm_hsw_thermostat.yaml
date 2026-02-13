@@ -6,20 +6,24 @@ adapter_tmp_dir: /opt/data/private/openvla_icms/tmp
 artifact_dir: /opt/data/private/openvla_icms/artifacts
 probe_root_dir: /opt/data/private/modified_libero_rlds
 tmp_dir: /opt/data/private/openvla_icms/tmp
+server_profile: 4090_1gpu   # 4090_1gpu | v100_8gpu
 
 # Training data (update to your actual dataset name)
 dataset_name: libero_spatial_no_noops
 batch_size: 2
-max_steps: 500
-save_steps: 250
+max_steps: 10000
+save_steps: 1000
 merge_lora_during_training: false
-learning_rate: 9e-5
+learning_rate: 2e-4
 min_learning_rate: 5e-5
 lr_scheduler: cosine
 lr_warmup_steps: 20
-grad_accumulation_steps: 8
+grad_accumulation_steps: 4
 image_aug: true
 shuffle_buffer_size: 2000
+rlds_frame_parallel_calls: 24
+rlds_traj_transform_threads: 8
+rlds_traj_read_threads: 8
 
 # LoRA
 use_lora: true
@@ -31,8 +35,19 @@ use_wandb: false
 run_id_note: method
 
 # Resume
-resume_adapter_dir: /opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b32+lr-0.0002+lora-r16+dropout-0.0--method--image_aug
-resume_global_step: 250
+resume_adapter_dir: /opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b16+lr-0.0002+lora-r16+dropout-0.0--method--image_aug
+resume_global_step: 500
+
+# Periodic eval + early stopping
+enable_periodic_eval: true
+eval_every_steps: 1000
+eval_task_suite_name: libero_spatial
+eval_num_trials_per_task: 1
+eval_center_crop: true
+
+early_stopping_enabled: true
+early_stopping_patience: 5
+early_stopping_min_delta: 0.1
 
 # Method
 method_enabled: true
@@ -46,8 +61,8 @@ prompt_template: "In: {instruction}\nOut:"
 probe_dataset_name: libero_spatial_no_noops
 probe_batch_size: 4
 
-thermostat_update_interval: 5
-thermostat_warmup_steps: 50
+thermostat_update_interval: 100
+thermostat_warmup_steps: 100
 thermostat_min_beta: 0.2
 thermostat_max_beta: 0.8
 thermostat_min_gamma: 0.1

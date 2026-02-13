@@ -1,107 +1,174 @@
-# 断点续训说明（OpenVLA）
+# OpenVLA 训练与断点续训教程
 
-本文说明如何在本仓库进行断点续训，包含 LoRA 微调（finetune.py）与全量训练（train.py / FSDP 或 DDP）。
+本文是可直接执行的训练手册，覆盖：
+- 如何找到“正在训练”的终端
+- 如何从 `run_method_train.sh` 启动/续训
+- 训练命令需要哪些参数、这些参数在代码哪里定义
+- 如何开启“每 N 步自动评测 + 早停”
 
-## 1. LoRA 微调（vla-scripts/finetune.py）
+---
 
-### 1.1 必备前提
-- 你需要一个已保存的 LoRA adapter 目录，里面至少包含：
-  - adapter_config.json
-  - adapter_model.safetensors
-- 该目录通常位于 run 生成的 adapter_tmp_dir 下，例如：
-  /opt/data/private/openvla_icms/tmp/<exp_id>
+## 1) 我看不到训练终端了，怎么找？
 
-### 1.2 配置文件里需要设置的字段
-在你的 YAML（如 configs/method_icsm_hsw_thermostat.yaml）中：
-
-```yaml
-resume_adapter_dir: /opt/data/private/openvla_icms/tmp/<exp_id>
-resume_global_step: 250
-```
-
-说明：
-- resume_adapter_dir 用来加载 LoRA 权重，并会尝试加载该目录下的 trainer_state.pt。
-- resume_global_step 用于步数偏移；如果为 0 且 trainer_state.pt 存在，会使用其中的 global_step。
-
-### 1.3 启动续训
+### 1.1 先查训练进程在哪个终端（TTY）
 ```bash
-bash scripts/run_method_train.sh 1
+ps -ef | grep -E 'run_method_train.sh|vla-scripts/finetune.py|torchrun --standalone' | grep -v grep
 ```
 
-### 1.4 如果你不想续训（从头训练）
-请这样设置：
-- 删除或注释 resume_adapter_dir 和 resume_full_model_dir（如果有）
-- 将 resume_global_step 设为 0
+你会看到类似：
+- `... pts/5 ... bash scripts/run_method_train.sh ...`
 
-示例：
-```yaml
-# resume_adapter_dir: /opt/data/private/openvla_icms/tmp/<exp_id>
-resume_global_step: 0
+这表示训练是从 `pts/5` 这个终端启动的。
+
+### 1.2 如果原终端窗口已经丢失/关闭
+VS Code 无法“重新附着”到已丢失的历史终端会话。建议直接新开终端看日志：
+
+```bash
+tail -f /opt/data/private/openvla_icms/runs/train_logs/RUN_METHOD_RESUME_*.log
 ```
 
-注意：
-- 不要把 resume_global_step 改成 None 或 null。当前代码会执行 int()，会报错。
+更稳妥（只看最新一个文件）：
+```bash
+LATEST=$(ls -1t /opt/data/private/openvla_icms/runs/train_logs/RUN_METHOD_RESUME_*.log | head -n 1)
+echo "$LATEST"
+tail -f "$LATEST"
+```
 
-### 1.5 重要限制（必须知道）
-当前 finetune 续训会恢复 LoRA 权重与 optimizer/scheduler 状态（若 trainer_state.pt 存在）。
-仍然不会恢复训练指标与日志状态。
-
-trainer_state.pt 保存位置：
-- 最新状态：resume_adapter_dir/trainer_state.pt
-- 若 save_latest_checkpoint_only=false：每个 step 的 checkpoint 目录也会保存一份
+> 说明：训练日志与终端输出是同一份信息。即使终端丢了，日志仍可实时看。
 
 ---
 
-## 2. 全量训练（vla-scripts/train.py，FSDP/DDP）
+## 2) 推荐启动方式（run_method_train）
 
-### 2.1 断点文件位置
-训练会在 run 目录下保存：
-```
-<run_root_dir>/<run_id>/checkpoints/step-000250-epoch-00-loss=2.3456.pt
-```
+### 2.0 先选服务器档位（新增开关）
+在 `configs/method_icsm_hsw_thermostat.yaml` 设置：
 
-### 2.2 续训配置
-在对应的 TrainConfig 里（通常不是 finetune.yaml，而是 train 相关配置）：
 ```yaml
-pretrained_checkpoint: /opt/data/private/openvla_icms/runs/<run_id>/checkpoints/step-000250-epoch-00-loss=2.3456.pt
-is_resume: true
-resume_step: 250
-resume_epoch: 0
+server_profile: 4090_1gpu   # 或 v100_8gpu
 ```
 
 说明：
-- pretrained_checkpoint 必须指向具体的 checkpoint 文件；
-- resume_step 和 resume_epoch 要与文件名里的 step/epoch 对齐，否则会触发断言。
+- `4090_1gpu`：默认 `nproc=1`，更激进的单卡吞吐参数。
+- `v100_8gpu`：默认 `nproc=8`，更保守的每卡 batch + 更稀疏 thermostat 更新。
+- 如果命令第1个参数写 `auto` 或不传，会按 `server_profile` 自动选择卡数。
+
+### 2.1 标准续训命令（推荐）
+```bash
+cd /workspace/openvla
+export RESUME_ADAPTER=/opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b16+lr-0.0002+lora-r16+dropout-0.0--method--image_aug
+bash scripts/run_method_train.sh auto 10000 1000 1000 5
+```
+
+参数含义：
+- `1`：GPU 进程数（`NPROC`）
+- `10000`：目标总步数（`TARGET_STEPS`）
+- `1000`：保存间隔（`SAVE_STEPS`）
+- `1000`：每 N 步评测一次（`EVAL_EVERY`）
+- `5`：早停 patience（`PATIENCE`）
+
+### 2.2 不传 `RESUME_ADAPTER` 时
+脚本会自动在以下目录里选最新 adapter：
+- `/opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b16+...`
+- `/opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b32+...`
+
+### 2.3 强制指定续训步数（可选）
+```bash
+export RESUME_STEP=500
+bash scripts/run_method_train.sh 1 10000 1000 1000 5
+```
+
+不指定时会自动从 `RESUME_ADAPTER/trainer_state.pt` 读取 `global_step`。
 
 ---
 
-## 3. 常见问题（FAQ）
+## 3) 训练参数在哪定义？
 
-### 3.1 为什么 SIGKILL (exitcode -9)？
-这通常是系统 OOM 杀进程（显存或内存不足）。常见触发点：
-- batch_size 太大
-- grad_accumulation_steps 太大
-- probe_batch_size 太大（method 模式下会额外前向）
-- 同时保存/合并模型导致峰值内存
+### 3.1 启动脚本参数入口
+- 文件：`scripts/run_method_train.sh`
+- 位置：脚本开头的参数解析
+  - `NPROC=${1:-1}`
+  - `TARGET_STEPS=${2:-10000}`
+  - `SAVE_STEPS=${3:-1000}`
+  - `EVAL_EVERY=${4:-1000}`
+  - `PATIENCE=${5:-5}`
 
-建议尝试：
-1) 降低 batch_size 或 grad_accumulation_steps
-2) 降低 probe_batch_size
-3) 将 merge_lora_during_training 保持为 false
-4) 先关闭 method_enabled 进行对照验证
+### 3.2 训练主配置（YAML）
+- 文件：`configs/method_icsm_hsw_thermostat.yaml`
+- 关键字段：
+  - 训练：`batch_size` `learning_rate` `max_steps` `save_steps`
+  - 续训：`resume_adapter_dir` `resume_global_step`
+  - 评测：`enable_periodic_eval` `eval_every_steps` `eval_num_trials_per_task`
+  - 早停：`early_stopping_enabled` `early_stopping_patience` `early_stopping_min_delta`
 
-### 3.2 如何确认是否真的 OOM？
-建议查看系统日志（需 root）：
-```
-dmesg | tail -n 50
-```
-如果看到 OOM kill 的记录，就能确认原因。
+### 3.3 代码默认值定义（最终来源）
+- 文件：`vla-scripts/finetune.py`
+- 位置：`FinetuneConfig` dataclass
+
+> 优先级：命令行参数 > YAML 配置 > `FinetuneConfig` 默认值。
 
 ---
 
-## 4. 推荐操作清单
-- 续训前先确认 adapter_dir / checkpoint 是否存在
-- 续训时记录 resume_global_step 与 save_steps 对齐
-- 需要完全可复现时建议加上手动日志记录（步数、lr、loss）
+## 4) 每 N 步自动评测 + 早停（已集成）
 
-如需我帮你把“optimizer/scheduler 恢复”也做上，告诉我你的训练入口与保存策略要求。
+现在 `finetune.py` 已内置：
+- 每到 `eval_every_steps` 且完成 checkpoint 保存后，自动调用 `experiments/robot/libero/run_libero_eval.py`
+- 自动解析成功率
+- 若启用早停：连续 `early_stopping_patience` 次评测无提升（阈值 `early_stopping_min_delta`）则停止训练
+
+推荐组合：
+```yaml
+enable_periodic_eval: true
+eval_every_steps: 1000
+eval_num_trials_per_task: 1
+early_stopping_enabled: true
+early_stopping_patience: 5
+early_stopping_min_delta: 0.1
+```
+
+---
+
+## 5) 常用排查命令
+
+### 5.1 查看是否在训练
+```bash
+ps -ef | grep -E 'run_method_train.sh|vla-scripts/finetune.py' | grep -v grep
+```
+
+### 5.2 看最新训练日志
+```bash
+LATEST=$(ls -1t /opt/data/private/openvla_icms/runs/train_logs/RUN_METHOD_RESUME_*.log | head -n 1)
+tail -n 200 "$LATEST"
+```
+
+### 5.3 看评测日志
+```bash
+ls -1t /opt/data/private/openvla_icms/runs/eval_logs/EVAL-libero_spatial-openvla-*.txt | head
+```
+
+### 5.4 看 OOM 线索
+```bash
+dmesg | tail -n 80
+```
+
+---
+
+## 6) 一键模板（直接复制）
+
+### 6.1 续训（推荐）
+```bash
+cd /workspace/openvla
+export HF_ENDPOINT=https://hf-mirror.com
+export RESUME_ADAPTER=/opt/data/private/openvla_icms/tmp/openvla-7b+libero_spatial_no_noops+b16+lr-0.0002+lora-r16+dropout-0.0--method--image_aug
+bash scripts/run_method_train.sh 1 10000 1000 1000 5
+```
+
+### 6.2 从头训练（不续训）
+```bash
+cd /workspace/openvla
+export HF_ENDPOINT=https://hf-mirror.com
+unset RESUME_ADAPTER
+export RESUME_STEP=0
+bash scripts/run_method_train.sh 1 10000 1000 1000 5
+```
+
+如果你希望，我可以再给你补一版“多卡训练参数模板（2卡/4卡）”直接贴在这个文档末尾。

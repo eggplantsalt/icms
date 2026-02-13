@@ -79,6 +79,7 @@ class GenerateConfig:
     run_root_dir: str = "/opt/data/private/openvla_icms/runs"  # Root directory for eval logs
     cache_dir: str = "/opt/data/private/openvla_icms/hf_cache"  # HF cache directory
     local_log_dir: Optional[str] = None              # Optional override for eval logs
+    dataset_stats_dir: Optional[str] = None          # Optional dir containing dataset_statistics.json
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
@@ -105,7 +106,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
-    # [OpenVLA] Set action un-normalization key
+    # [OpenVLA] Set action un-normalization key (robust to custom fine-tune stats keys)
     cfg.unnorm_key = cfg.task_suite_name
 
     # Load model
@@ -117,7 +118,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # with the suffix "_no_noops" in the dataset name)
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
-        assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+
+        # If still missing, and stats only contain one dataset key, auto-fallback to that key.
+        if cfg.unnorm_key not in model.norm_stats and len(model.norm_stats) == 1:
+            cfg.unnorm_key = next(iter(model.norm_stats.keys()))
+            print(f"[warn] Auto-fallback unnorm_key to the only available stats key: {cfg.unnorm_key}")
+
+        assert cfg.unnorm_key in model.norm_stats, (
+            f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`! "
+            f"Available keys: {list(model.norm_stats.keys())}"
+        )
 
     # [OpenVLA] Get Hugging Face processor
     processor = None

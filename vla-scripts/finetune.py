@@ -268,6 +268,18 @@ def finetune(cfg: FinetuneConfig) -> None:
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
+    resume_state_step = None
+    if cfg.resume_adapter_dir is not None:
+        trainer_state_path = cfg.resume_adapter_dir / "trainer_state.pt"
+        if trainer_state_path.exists():
+            trainer_state = torch.load(trainer_state_path, map_location="cpu")
+            optimizer.load_state_dict(trainer_state.get("optimizer", {}))
+            if scheduler is not None and trainer_state.get("scheduler") is not None:
+                scheduler.load_state_dict(trainer_state["scheduler"])
+            resume_state_step = int(trainer_state.get("global_step", 0))
+            if distributed_state.is_main_process:
+                print(f"Resumed optimizer/scheduler from: {trainer_state_path}")
+
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
@@ -407,7 +419,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
     # Train!
-    start_step = max(0, int(cfg.resume_global_step))
+    if cfg.resume_global_step > 0:
+        start_step = int(cfg.resume_global_step)
+        if resume_state_step is not None and resume_state_step > 0 and resume_state_step != start_step:
+            if distributed_state.is_main_process:
+                print(
+                    "[warn] resume_global_step does not match trainer_state global_step: "
+                    f"cfg={start_step} state={resume_state_step}"
+                )
+    else:
+        start_step = int(resume_state_step) if resume_state_step is not None else 0
     if start_step >= cfg.max_steps:
         raise ValueError("resume_global_step must be < max_steps")
 
@@ -535,12 +556,32 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if distributed_state.is_main_process:
                     print(f"Saving Model Checkpoint for Step {gradient_step_idx}")
 
-                    # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-                    save_dir = adapter_dir if cfg.use_lora else run_dir
+                    # If we keep all checkpoints, save into a step-specific directory
+                    if cfg.save_latest_checkpoint_only:
+                        checkpoint_dir = run_dir
+                    else:
+                        checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
+
+                    def _save_trainer_state(save_dir: Path) -> None:
+                        state = {"global_step": gradient_step_idx, "optimizer": optimizer.state_dict()}
+                        if scheduler is not None:
+                            state["scheduler"] = scheduler.state_dict()
+                        torch.save(state, save_dir / "trainer_state.pt")
 
                     # Save Processor & Weights
-                    processor.save_pretrained(run_dir)
-                    vla.module.save_pretrained(save_dir)
+                    processor.save_pretrained(checkpoint_dir)
+                    if cfg.use_lora:
+                        # Always keep latest adapter in adapter_dir; optionally also keep per-step history.
+                        vla.module.save_pretrained(adapter_dir)
+                        _save_trainer_state(adapter_dir)
+                        if not cfg.save_latest_checkpoint_only:
+                            vla.module.save_pretrained(checkpoint_dir)
+                            _save_trainer_state(checkpoint_dir)
+                    else:
+                        vla.module.save_pretrained(checkpoint_dir)
+                        _save_trainer_state(checkpoint_dir)
 
                 # Wait for processor and adapter weights to be saved by main process
                 dist.barrier()

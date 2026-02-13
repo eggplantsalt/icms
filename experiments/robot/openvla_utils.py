@@ -8,6 +8,7 @@ import numpy as np
 import tensorflow as tf
 import torch
 from PIL import Image
+from peft import PeftModel
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
@@ -40,15 +41,32 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    adapter_config_path = os.path.join(cfg.pretrained_checkpoint, "adapter_config.json")
+    if os.path.isfile(adapter_config_path):
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_cfg = json.load(f)
+        base_model_path = adapter_cfg.get("base_model_name_or_path", "openvla/openvla-7b")
+        base_model = AutoModelForVision2Seq.from_pretrained(
+            base_model_path,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=cfg.load_in_8bit,
+            load_in_4bit=cfg.load_in_4bit,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        vla = PeftModel.from_pretrained(base_model, cfg.pretrained_checkpoint)
+        print(f"[*] Loaded LoRA adapter from: {cfg.pretrained_checkpoint}")
+    else:
+        vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.pretrained_checkpoint,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=cfg.load_in_8bit,
+            load_in_4bit=cfg.load_in_4bit,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
@@ -57,11 +75,42 @@ def get_vla(cfg):
         vla = vla.to(DEVICE)
 
     # Load dataset stats used during finetuning (for action un-normalization).
-    dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
-    if os.path.isfile(dataset_statistics_path):
+    candidate_stats_dirs = []
+    if getattr(cfg, "dataset_stats_dir", None):
+        candidate_stats_dirs.append(cfg.dataset_stats_dir)
+    candidate_stats_dirs.append(cfg.pretrained_checkpoint)
+    candidate_stats_dirs.append(os.path.join("/opt/data/private/openvla_icms/runs", os.path.basename(cfg.pretrained_checkpoint)))
+
+    dataset_statistics_path = None
+    for stats_dir in candidate_stats_dirs:
+        if not stats_dir:
+            continue
+        candidate = os.path.join(stats_dir, "dataset_statistics.json")
+        if os.path.isfile(candidate):
+            dataset_statistics_path = candidate
+            break
+
+    if dataset_statistics_path is not None:
         with open(dataset_statistics_path, "r") as f:
             norm_stats = json.load(f)
-        vla.norm_stats = norm_stats
+        # `vla` may be a PEFT wrapper. Propagate stats to all likely wrapped objects so
+        # `predict_action()` always sees the finetuned dataset keys.
+        targets = [vla]
+        if hasattr(vla, "model"):
+            targets.append(vla.model)
+        if hasattr(vla, "base_model"):
+            targets.append(vla.base_model)
+            if hasattr(vla.base_model, "model"):
+                targets.append(vla.base_model.model)
+        for target in targets:
+            try:
+                setattr(target, "norm_stats", norm_stats)
+            except Exception:
+                pass
+        print(
+            f"[*] Loaded dataset statistics from: {dataset_statistics_path} "
+            f"(keys={list(norm_stats.keys())[:3]}, total={len(norm_stats)})"
+        )
     else:
         print(
             "WARNING: No local dataset_statistics.json file found for current checkpoint.\n"
@@ -74,7 +123,14 @@ def get_vla(cfg):
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    adapter_config_path = os.path.join(cfg.pretrained_checkpoint, "adapter_config.json")
+    if os.path.isfile(adapter_config_path):
+        with open(adapter_config_path, "r", encoding="utf-8") as f:
+            adapter_cfg = json.load(f)
+        processor_path = adapter_cfg.get("base_model_name_or_path", "openvla/openvla-7b")
+    else:
+        processor_path = cfg.pretrained_checkpoint
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
     return processor
 
 

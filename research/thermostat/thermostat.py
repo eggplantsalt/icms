@@ -22,6 +22,7 @@ class ThermostatConfig:
     max_gamma: float = 1.0
     k_beta: float = 1.0
     k_gamma: float = 1.0
+    base_scale: float = 1.0
 
 
 @dataclass
@@ -118,7 +119,9 @@ class Thermostat:
         baseline = state.drift_baseline or d
         if state.drift_baseline is None:
             state.drift_baseline = baseline
-        delta = max(0.0, d - baseline)
+
+        effective_baseline = baseline * self.config.base_scale
+        delta = max(0.0, d - effective_baseline)
 
         beta = self.config.max_beta / (1.0 + self.config.k_beta * delta)
         gamma = self.config.max_gamma / (1.0 + self.config.k_gamma * delta)

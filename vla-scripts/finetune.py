@@ -126,6 +126,7 @@ class FinetuneConfig:
     eval_num_trials_per_task: int = 1                                # Number of trials per task during periodic eval
     eval_center_crop: bool = True                                    # Whether to use center crop during eval
     eval_run_id_note: Optional[str] = None                           # Optional extra run_id note for eval logs
+    eval_cpu_fallback_on_oom: bool = True                            # Retry eval on CPU when GPU OOM happens
 
     early_stopping_enabled: bool = False                             # Stop training when eval metric stops improving
     early_stopping_patience: int = 5                                 # Number of eval rounds without improvement before stop
@@ -172,6 +173,7 @@ class FinetuneConfig:
     thermostat_max_gamma: float = 1.0
     thermostat_k_beta: float = 1.0
     thermostat_k_gamma: float = 1.0
+    thermostat_base_scale: float = 1.0
 
     # fmt: on
 
@@ -362,6 +364,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             max_gamma=cfg.thermostat_max_gamma,
             k_beta=cfg.thermostat_k_beta,
             k_gamma=cfg.thermostat_k_gamma,
+            base_scale=cfg.thermostat_base_scale,
         )
         thermostat = Thermostat(
             teacher_stats=teacher_stats,
@@ -522,10 +525,22 @@ def finetune(cfg: FinetuneConfig) -> None:
         result = subprocess.run(eval_cmd, capture_output=True, text=True, env=eval_env)
         if distributed_state.is_main_process:
             if result.returncode != 0:
-                print(f"[eval] failed at step {step} with code {result.returncode}")
-                if result.stderr:
-                    print(result.stderr[-2000:])
-                return None
+                stderr_text = result.stderr or ""
+                stdout_text = result.stdout or ""
+                oom_hit = "outofmemoryerror" in stderr_text.lower() or "cuda out of memory" in stderr_text.lower()
+                if cfg.eval_cpu_fallback_on_oom and oom_hit:
+                    print(f"[eval] GPU OOM at step {step}; retrying eval on CPU...")
+                    eval_env_cpu = eval_env.copy()
+                    eval_env_cpu["CUDA_VISIBLE_DEVICES"] = ""
+                    result = subprocess.run(eval_cmd, capture_output=True, text=True, env=eval_env_cpu)
+
+                if result.returncode != 0:
+                    print(f"[eval] failed at step {step} with code {result.returncode}")
+                    if result.stderr:
+                        print(result.stderr[-2000:])
+                    elif result.stdout:
+                        print(result.stdout[-2000:])
+                    return None
 
             eval_log_dir = cfg.run_root_dir / "eval_logs"
             pattern = f"EVAL-{cfg.eval_task_suite_name}-openvla-*--{run_note}.txt"
